@@ -68,14 +68,11 @@ def apply_rotary_pos_emb(
     interleaved = False
     embeded_query = torch.empty_like(query)
     embeded_key = torch.empty_like(key)
-    if position_ids is not None:
-        cos = cos_full[position_ids]
-        sin = sin_full[position_ids]
     #view totalSeq as a long sequence
     cu_seq_lens = torch.Tensor([0,query.shape[0]]).long().mlu()
     max_context_len = query.shape[0]
-    bt_ops.apply_rotary(embeded_query, query, sin, cos, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
-    bt_ops.apply_rotary(embeded_key, key, sin, cos, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
+    bt_ops.apply_rotary(embeded_query, query, sin_full, cos_full, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
+    bt_ops.apply_rotary(embeded_key, key, sin_full, cos_full, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
     return embeded_query,embeded_key
 
 @register_ops(vendor_ops_registry)
