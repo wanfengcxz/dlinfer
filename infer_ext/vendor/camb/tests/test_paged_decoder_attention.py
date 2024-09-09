@@ -147,8 +147,8 @@ def test_ref_paged_attn_0():
     diff = (ref_output - dev_output.cpu()).mean()
     print("the mean difference between ref and dev is: ", diff)
     if diff and torch.allclose(ref_output, dev_output.cpu(), rtol=1e-05, atol=1e-08, equal_nan=False) < 0.0001:
-        print("test_apply_rotary_0: pass")
+        print("test_ref_paged_attn_0: pass")
     else:
-        print("test_apply_rotary_0: not close")
+        print("test_ref_paged_attn_0: not close")
 if __name__ == '__main__':
     test_ref_paged_attn_0()

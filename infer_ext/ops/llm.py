@@ -40,11 +40,12 @@ def apply_rotary_pos_emb(
     sin: Optional[Tensor],
     position_ids: Optional[Tensor],
     cos_full: Optional[Tensor],
-    sin_full: Optional[Tensor]
+    sin_full: Optional[Tensor],
+    cu_seq_lens: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
     return vendor_ops_registry["apply_rotary_pos_emb"](
         query, key, cos, sin, position_ids,
-        cos_full, sin_full
+        cos_full, sin_full, cu_seq_lens
     )
 
 @register_custom_op_default_value({
@@ -64,6 +65,7 @@ def context_attention(
     attn_qk_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
+    cu_seq_lens: Optional[Tensor],
 ) -> Tensor:
     return vendor_ops_registry["context_attention"](
         query,
@@ -77,6 +79,7 @@ def context_attention(
         attn_qk_scale,
         alibi_slopes,
         attn_output,
+        cu_seq_lens,
     )
 
 @register_custom_op("infer_ext::fill_kv_cache",

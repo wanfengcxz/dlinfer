@@ -23,7 +23,7 @@ __all__ =[
 def rms_norm(
     hidden_states: Tensor,
     weight: Tensor,
-    epsilon: float
+    epsilon: float,
 ) -> Tensor:
     store_output_before_norm = False
     dim = hidden_states.ndim
@@ -61,15 +61,14 @@ def apply_rotary_pos_emb(
     sin: Optional[Tensor],
     position_ids: Optional[Tensor],
     cos_full: Optional[Tensor],
-    sin_full: Optional[Tensor]
+    sin_full: Optional[Tensor],
+    cu_seq_lens: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
     assert query.ndim == 3, "only support q:[totalSeq, head ,head_dim]"
     assert key.ndim == 3, "only support k:[totalSeq, head ,head_dim]"
     interleaved = False
     embeded_query = torch.empty_like(query)
     embeded_key = torch.empty_like(key)
-    #view totalSeq as a long sequence
-    cu_seq_lens = torch.Tensor([0,query.shape[0]]).long().mlu()
     max_context_len = query.shape[0]
     bt_ops.apply_rotary(embeded_query, query, sin_full, cos_full, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
     bt_ops.apply_rotary(embeded_key, key, sin_full, cos_full, position_ids, cu_seq_lens, interleaved, True, False, max_context_len)
@@ -109,6 +108,7 @@ def context_attention(
     attn_qk_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
+    cu_seq_lens: Optional[Tensor],
 ) -> Tensor:
     max_seq_len = torch.max(seq_len).to(dtype=torch.int32)
     if attn_output == None:
@@ -120,9 +120,7 @@ def context_attention(
         softmax_scale = 1
     total_q_seqLen = int(query.shape[0])
     last = torch.Tensor([total_q_seqLen]).mlu().to(torch.int32)
-    cu_seq_len = q_start_loc.to(torch.int32)
-    cu_seq_len = torch.cat((cu_seq_len,last),dim=0)
-    bt_ops.flash_attention(query, key, value, cu_seq_len, alibi_slopes, None, attn_output, max_seq_len, softmax_scale, True, -1, -1)
+    bt_ops.flash_attention(query, key, value, cu_seq_lens, alibi_slopes, None, attn_output, max_seq_len, softmax_scale, True, -1, -1)
     return attn_output
 
 @register_ops(vendor_ops_registry)
@@ -139,11 +137,11 @@ def paged_decode_attention(
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
 ) -> Tensor:
-    assert query.ndim == 4, "only support q:[batch,seq_q=1, head ,head_dim]"
+    assert query.ndim == 4, "only support q: [batch, seq_q=1, head ,head_dim]"
     assert query.shape[1] == 1, "only support seq_q = 1 in paged decode attention"
-    assert key_cache.ndim == 4, "only support k_cache:[num_blocks, kv_head_num, block_size, head_size]"
-    assert value_cache.ndim == 4, "only support v_cache:[num_blocks, kv_head_num, block_size, head_size]"
-    assert block_table.ndim == 2, "only support bloack_table:[batch_size, max_num_blocks_per_seq]"
+    assert key_cache.ndim == 4, "only support k_cache: [num_blocks, kv_head_num, block_size, head_size]"
+    assert value_cache.ndim == 4, "only support v_cache: [num_blocks, kv_head_num, block_size, head_size]"
+    assert block_table.ndim == 2, "only support bloack_table: [batch_size, max_num_blocks_per_seq]"
     
     batch_size = block_table.shape[0]
     dim = query.shape[3]
