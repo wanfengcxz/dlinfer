@@ -90,7 +90,11 @@ def fill_kv_cache(
     key = key.contiguous()
     value = value.contiguous()
 
-    bt_ops.reshape_paged_cache(key, value, key_cache, value_cache, kv_indices)
+    block_num, block_size, head_num, head_size = key_cache.shape
+    key_cache_reshaped = key_cache.view(block_num, head_num, block_size, head_size)
+    value_cache_reshaped = value_cache.view(block_num, head_num, block_size, head_size)
+
+    bt_ops.reshape_paged_cache(key, value, key_cache_reshaped, value_cache_reshaped, kv_indices)
     return key_cache, value_cache
 
 @register_ops(vendor_ops_registry)
