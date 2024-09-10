@@ -66,6 +66,7 @@ def context_attention(
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
     cu_seq_lens: Optional[Tensor],
+    max_seq_len: Optional[Tensor],
 ) -> Tensor:
     return vendor_ops_registry["context_attention"](
         query,
@@ -80,6 +81,7 @@ def context_attention(
         alibi_slopes,
         attn_output,
         cu_seq_lens,
+        max_seq_len,
     )
 
 @register_custom_op("infer_ext::fill_kv_cache",
@@ -112,6 +114,7 @@ def paged_decode_attention(
     attn_qk_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
+    max_context_lens: Optional[Tensor],
 ) -> Tensor:
     return vendor_ops_registry["paged_decode_attention"](
         query,
@@ -125,6 +128,7 @@ def paged_decode_attention(
         attn_qk_scale,
         alibi_slopes,
         attn_output,
+        max_context_lens,
     )
 
 @register_custom_op_default_value({
