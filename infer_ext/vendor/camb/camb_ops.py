@@ -91,10 +91,11 @@ def fill_kv_cache(
     value = value.contiguous()
 
     block_num, block_size, head_num, head_size = key_cache.shape
-    key_cache_reshaped = key_cache.view(block_num, head_num, block_size, head_size)
-    value_cache_reshaped = value_cache.view(block_num, head_num, block_size, head_size)
+    #key_cache_reshaped = key_cache.view(block_num, head_num, block_size, head_size)
+    #value_cache_reshaped = value_cache.view(block_num, head_num, block_size, head_size)
 
-    bt_ops.reshape_paged_cache(key, value, key_cache_reshaped, value_cache_reshaped, kv_indices)
+    #bt_ops.reshape_paged_cache(key, value, key_cache_reshaped, value_cache_reshaped, kv_indices)
+    bt_ops.reshape_paged_cache(key, value, key_cache, value_cache, kv_indices)
     return key_cache, value_cache
 
 @register_ops(vendor_ops_registry)
@@ -150,9 +151,9 @@ def paged_decode_attention(
     v_cache_quant_scale = None
 
     softmax_scale = 1. / math.sqrt(head_dim)
-    out = attn_output.view_as(query)
+    #out = attn_output.view_as(query)
 
-    bt_ops.single_query_cached_kv_attn(query, key_cache, value_cache, block_table, kv_seq_len,k_cache_quant_scale, v_cache_quant_scale, alibi_slopes, out, max_context_lens, 0, 0, softmax_scale)
+    bt_ops.single_query_cached_kv_attn(query, key_cache, value_cache, block_table, kv_seq_len,k_cache_quant_scale, v_cache_quant_scale, alibi_slopes, attn_output, max_context_lens, 0, 0, softmax_scale)
 
 if __name__ == '__main__':
     pass
