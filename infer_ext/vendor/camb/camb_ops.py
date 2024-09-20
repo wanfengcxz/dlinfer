@@ -86,10 +86,6 @@ def fill_kv_cache(
         "only support key_cache, value_cache: [block_num, head_num, block_size, head_size]"
     assert kv_indices.ndim == 1, "only support kv_indices: [total_seq_len]"
     
-    # only support contiguous k,v
-    key = key.contiguous()
-    value = value.contiguous()
-
     block_num, block_size, head_num, head_size = key_cache.shape
     #key_cache_reshaped = key_cache.view(block_num, head_num, block_size, head_size)
     #value_cache_reshaped = value_cache.view(block_num, head_num, block_size, head_size)
