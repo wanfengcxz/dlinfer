@@ -29,7 +29,7 @@ def rms_norm(
     dim = hidden_states.ndim
     assert dim == 2 or dim == 3, "only support hidden_states: [total_seq_len, head_size]"
     if dim == 2:
-        hidden_states = hidden_states.contiguous()
+        # hidden_states = hidden_states.contiguous()
         normed_hidden_states = bt_ops.fused_rms_norm(hidden_states, None, weight, None, None, epsilon, store_output_before_norm)[0]
         return normed_hidden_states    
     if dim == 3:
