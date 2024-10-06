@@ -17,6 +17,7 @@ set(DEVICE "" CACHE STRING "device string, default empty string")
 string(TOLOWER "${DEVICE}" DEVICE)
 
 list(APPEND SUPPORTED_DEVICE "ascend")
+list(APPEND SUPPORTED_DEVICE "camb")
 
 if(NOT DEVICE)
   message(FATAL_ERROR "Please specify variable DEVICE of dlinfer!")
