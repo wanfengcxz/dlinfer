@@ -54,7 +54,6 @@ def apply_rotary_pos_emb(
     cos: Optional[Tensor],
     sin: Optional[Tensor],
     cos_sin_cache: Optional[Tensor],
-    cos_sin_ids: Optional[Tensor],
     cu_seqlens: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
     """
@@ -86,7 +85,6 @@ def apply_rotary_pos_emb(
         key,
         cos,
         sin,
-        cos_sin_ids,
         cu_seqlens,
     )
 
