@@ -87,6 +87,7 @@ def AscendCudaGraphMixin_fill_buffers_cudagraph(
     block_offsets: Tensor = attn_metadata.block_offsets
     kv_seqlens: Tensor = attn_metadata.kv_seqlens
     kv_start_indices: Tensor = attn_metadata.kv_start_indices
+    q_start_loc: Tensor = attn_metadata.q_start_loc
 
     input_buffers: BuffType = graph_meta.input_buffers
 
@@ -99,6 +100,7 @@ def AscendCudaGraphMixin_fill_buffers_cudagraph(
     input_buffers["block_offsets"][:batch_size, :num_blocks] = block_offsets
     input_buffers["kv_seqlens"][:batch_size] = kv_seqlens
     input_buffers["kv_start_indices"][:batch_size] = kv_start_indices
+    input_buffers["q_start_loc"][:batch_size+1] = q_start_loc
 
     if inputs_embeds is not None:
         emb_size = inputs_embeds.size(-1)
@@ -114,6 +116,7 @@ def AscendCudaGraphMixin_fill_buffers_cudagraph(
     attn_metadata.block_offsets = input_buffers["block_offsets"][:new_batch_size]
     attn_metadata.kv_seqlens = input_buffers["kv_seqlens"][:new_batch_size]
     attn_metadata.kv_start_indices = input_buffers["kv_start_indices"][:new_batch_size]
+    attn_metadata.q_start_loc = input_buffers["q_start_loc"][:new_batch_size+1]
 
     new_inputs = dict(
         past_key_values=past_key_values,
