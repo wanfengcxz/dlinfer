@@ -941,7 +941,7 @@ def vendor_device_init():
         patch_state_cache_engine()
         patch_gated_delta_net()      # MUST be before patch_attention_is_tp
         patch_qwen3_5()
-        patch_ray_init()
+        # patch_ray_init()
 
 
 vendor_device_init()
