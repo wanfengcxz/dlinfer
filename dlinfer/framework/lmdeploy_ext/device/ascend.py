@@ -133,18 +133,23 @@ class AscendMoEForwardDPTP:
         self.topk = topk_ids.size(-1)
         self.dp_size = len(step_ctx.dp_meta.moe_tp_sizes)
 
+        # MTP decode sends max_batch_size * (num_spec_tokens + 1) tokens per step.
+        # Pre-allocate for the worst case to avoid runtime reallocation.
+        num_spec_tokens = get_step_ctx_manager().build_ctx.num_spec_tokens
+        max_tokens = self.max_batch_size * (num_spec_tokens + 1)
+
         global hidden_states_gather_buffer
         global topk_weights_gather_buffer
         global topk_ids_gather_buffer
 
         hidden_states_gather_buffer = hidden_states.new_empty(
-            self.max_batch_size * self.dp_size * self.hidden_size
+            max_tokens * self.dp_size * self.hidden_size
         )
         topk_weights_gather_buffer = topk_weights.new_empty(
-            self.max_batch_size * self.dp_size * self.topk
+            max_tokens * self.dp_size * self.topk
         )
         topk_ids_gather_buffer = topk_ids.new_empty(
-            self.max_batch_size * self.dp_size * self.topk
+            max_tokens * self.dp_size * self.topk
         )
 
     def all_gather(
@@ -212,14 +217,6 @@ class AscendMoEForwardDPTP:
             global hidden_states_gather_buffer
             global topk_weights_gather_buffer
             global topk_ids_gather_buffer
-
-            # MTP decode sends (batch_size * spec_num_tokens+1) tokens per step, which can
-            # exceed the buffer allocated with max_batch_size (1 token/seq assumed). Resize
-            # on the fly – this only happens during warmup before graph capture, so it is safe.
-            if needed_hs > hidden_states_gather_buffer.numel():
-                hidden_states_gather_buffer = hidden_states.new_empty(needed_hs)
-                topk_weights_gather_buffer = topk_weights.new_empty(needed_tw)
-                topk_ids_gather_buffer = topk_ids.new_empty(needed_tw)
 
             cur_hidden_states = hidden_states_gather_buffer[
                 :needed_hs
