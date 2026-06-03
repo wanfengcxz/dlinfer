@@ -56,9 +56,12 @@ def _process_bad_words_(
     filter_value: float = -99999.9999,
 ):
     """Process bad words."""
-    filtered_scores = scores.gather(1, bad_words)
+    # aclnnGather does not accept negative indices; replace invalid entries
+    # (which are negative padding values) with 0 before gather/scatter.
+    valid_bad_words = bad_words.where(mask, 0)
+    filtered_scores = scores.gather(1, valid_bad_words)
     filtered_scores = mask.to(filtered_scores.dtype) * filter_value + filtered_scores
-    scores.scatter_(1, bad_words, filtered_scores)
+    scores.scatter_(1, valid_bad_words, filtered_scores)
     return scores
 
 
@@ -202,15 +205,31 @@ class AscendMoEForwardDPTP:
         tp_sizes = step_ctx.dp_meta.moe_tp_sizes
 
         if self.use_comm_buffer:
+            num_tokens = hidden_states.size(0)
+            needed_hs = num_tokens * self.dp_size * self.hidden_size
+            needed_tw = num_tokens * self.dp_size * self.topk
+
+            global hidden_states_gather_buffer
+            global topk_weights_gather_buffer
+            global topk_ids_gather_buffer
+
+            # MTP decode sends (batch_size * spec_num_tokens+1) tokens per step, which can
+            # exceed the buffer allocated with max_batch_size (1 token/seq assumed). Resize
+            # on the fly – this only happens during warmup before graph capture, so it is safe.
+            if needed_hs > hidden_states_gather_buffer.numel():
+                hidden_states_gather_buffer = hidden_states.new_empty(needed_hs)
+                topk_weights_gather_buffer = topk_weights.new_empty(needed_tw)
+                topk_ids_gather_buffer = topk_ids.new_empty(needed_tw)
+
             cur_hidden_states = hidden_states_gather_buffer[
-                : hidden_states.size(0) * self.dp_size * self.hidden_size
-            ].view(hidden_states.size(0) * self.dp_size, self.hidden_size)
+                :needed_hs
+            ].view(num_tokens * self.dp_size, self.hidden_size)
             cur_topk_weights = topk_weights_gather_buffer[
-                : topk_weights.size(0) * self.dp_size * self.topk
-            ].view(topk_weights.size(0) * self.dp_size, self.topk)
+                :needed_tw
+            ].view(num_tokens * self.dp_size, self.topk)
             cur_topk_ids = topk_ids_gather_buffer[
-                : topk_ids.size(0) * self.dp_size * self.topk
-            ].view(topk_ids.size(0) * self.dp_size, self.topk)
+                :needed_tw
+            ].view(num_tokens * self.dp_size, self.topk)
 
             torch.distributed.all_gather_into_tensor(
                 cur_hidden_states,

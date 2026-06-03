@@ -566,8 +566,15 @@ class AscendGraphRunner(GraphRunner):
         dp_meta = inputs.dp_meta
         if is_decoding and dp_meta is not None:
             meta = self.get_meta()
-            padding_batch_size = meta.padding_batch_size
-            tp_size = self._get_capture_tokens(padding_batch_size)
+            padding_num_tokens = meta.padding_batch_size
+            max_q_seq_len = max(int(inputs.seq_length.max().item()), 1)
+            if max_q_seq_len > 1:
+                # MTP verify: padding_batch_size is total tokens (num_seqs * max_q_seq_len),
+                # but _get_capture_tokens expects a seq count bounded by max_batches.
+                padding_batch_size = (padding_num_tokens + max_q_seq_len - 1) // max_q_seq_len
+                tp_size = self._get_capture_tokens(padding_batch_size) * max_q_seq_len
+            else:
+                tp_size = self._get_capture_tokens(padding_num_tokens)
             dp_meta.tp_sizes = [tp_size] * len(dp_meta.tp_sizes)
         return inputs
 
