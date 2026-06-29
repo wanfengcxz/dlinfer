@@ -514,17 +514,28 @@ def patch_gated_delta_net():
             self.has_initial_state = attn_metadata.has_initial_state
             self.conv_state_indices = self.state_ids.to(torch.int32)
 
-    def build_rmsnorm_gated(hidden_size: int, eps=1e-6, **kwargs):
-        try:
-            from dlinfer.vendor.ascend.triton_ops import RMSNormGated
-        except Exception:
-            raise RuntimeError(
-                "Triton is not installed or Ascend triton_ops failed to load. "
-                "Please install triton-ascend to use this feature."
+    class TorchRMSNormGated(nn.Module):
+        def __init__(self, hidden_size: int, eps: float = 1e-6, device=None, **kwargs):
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(
+                torch.empty(hidden_size, device=device, dtype=torch.bfloat16)
             )
+            torch.nn.init.ones_(self.weight)
 
-        device = kwargs["device"]
-        return RMSNormGated(hidden_size, eps=eps, norm_before_gate=True, device=device)
+        def forward(self, x, z=None):
+            input_dtype = x.dtype
+            x_f32 = x.to(torch.float32)
+            variance = x_f32.pow(2).mean(-1, keepdim=True)
+            x_normed = x_f32 * torch.rsqrt(variance + self.eps)
+            y = x_normed * self.weight.to(torch.float32)
+            if z is not None:
+                y = y * F.silu(z.to(torch.float32))
+            return y.to(input_dtype)
+
+    def build_rmsnorm_gated(hidden_size: int, eps=1e-6, **kwargs):
+        device = kwargs.get("device")
+        return TorchRMSNormGated(hidden_size, eps=eps, device=device)
 
     class AscendCausalConv1dFunc:
 
