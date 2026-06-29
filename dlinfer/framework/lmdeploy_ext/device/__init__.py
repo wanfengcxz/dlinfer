@@ -370,6 +370,127 @@ def patch_gated_delta_net():
     from lmdeploy.pytorch.nn.gated_delta import GatedDeltaMeta
     from lmdeploy.pytorch.model_inputs import get_step_ctx_manager
 
+    # ------------------------------------------------------------------ #
+    # Pure-torch decode kernels (non-MTP single-token decoding).
+    #
+    # These mirror, op-for-op, the two triton kernels they replace:
+    #   * ``causal_conv1d_update_npu``                (causal_conv1d.py)
+    #   * ``fused_sigmoid_gating_delta_rule_update``  (fla/sigmoid_gating.py)
+    # and follow the reference torch implementations in transformers'
+    # ``modeling_qwen3_5.py`` (``torch_causal_conv1d_update`` /
+    # ``torch_recurrent_gated_delta_rule``).
+    # ------------------------------------------------------------------ #
+
+    def _l2norm_decode(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        # NB: eps is added *outside* the sqrt, matching the sigmoid-gating
+        # decode kernel (``b_q / (sqrt(sum(b_q*b_q)) + 1e-6)``).
+        return x / (torch.sqrt((x * x).sum(-1, keepdim=True)) + eps)
+
+    def torch_causal_conv1d_update_decode(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_state_indices: torch.Tensor,
+        activation: str,
+    ):
+        """Single-token causal conv1d update (decode), pure torch.
+
+        x: (num_tokens, dim)                          one query token per sequence
+        weight: (dim, width)                          depthwise conv weight (squeezed)
+        bias: (dim,) or None
+        conv_state: (num_caches, state_len_total, dim)  ring cache, updated in place
+        conv_state_indices: (num_tokens,)             cache slot for each token
+        returns: (num_tokens, dim)
+        """
+        dim, width = weight.shape
+        # The decode kernel keeps the last ``width - 1`` tokens of conv history
+        # (eff_state_len = width - 1 for the non-spec path), so only the first
+        # ``width - 1`` slots of the allocated state are used.
+        state_len = width - 1
+        idx = conv_state_indices.to(torch.long)
+
+        x = x.to(conv_state.dtype)
+        # prior conv history per token: (num_tokens, dim, state_len)
+        prev = conv_state[idx, :state_len, :].transpose(1, 2)
+        # append the new token along the time axis: (num_tokens, dim, width)
+        seq = torch.cat([prev, x.unsqueeze(-1)], dim=-1)
+        # roll the ring buffer: keep the most recent ``state_len`` tokens
+        if state_len > 0:
+            conv_state[idx, :state_len, :] = seq[..., -state_len:].transpose(1, 2).to(conv_state.dtype)
+        # depthwise causal conv over the kernel window -> one output per token
+        out = F.conv1d(seq, weight.unsqueeze(1), bias, padding=0, groups=dim).squeeze(-1)
+        if activation in ("silu", "swish"):
+            out = F.silu(out)
+        return out
+
+    def torch_sigmoid_gating_delta_rule_update_decode(
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        use_qk_l2norm_in_kernel: bool = True,
+        softplus_beta: float = 1.0,
+        softplus_threshold: float = 20.0,
+    ):
+        """Single-step sigmoid-gated delta rule update (decode), pure torch.
+
+        q, k: (1, N, H, K)    v: (1, N, HV, V)    a, b: (1, N, HV)
+        A_log, dt_bias: (HV,)
+        recurrent_state: (num_caches, HV, K, V)  fp32 cache, updated in place
+        state_indices: (N,)                      cache slot for each sequence
+        returns core_attn_out: (1, N, HV, V)
+        """
+        orig_dtype = q.dtype
+        _, N, H, K = q.shape
+        HV, V = v.shape[2], v.shape[3]
+
+        q = q.reshape(N, H, K).float()
+        k = k.reshape(N, H, K).float()
+        v = v.reshape(N, HV, V).float()
+        a = a.reshape(N, HV).float()
+        b = b.reshape(N, HV).float()
+
+        # Fused sigmoid gating:
+        #   beta = sigmoid(b)
+        #   g    = -exp(A_log) * softplus(a + dt_bias)
+        beta = torch.sigmoid(b)
+        g = -A_log.float().exp() * F.softplus(
+            a + dt_bias.float(), beta=softplus_beta, threshold=softplus_threshold
+        )
+
+        if use_qk_l2norm_in_kernel:
+            q = _l2norm_decode(q)
+            k = _l2norm_decode(k)
+        q = q * (K ** -0.5)
+
+        # GQA: broadcast key/query heads up to the number of value heads.
+        if HV != H:
+            rep = HV // H
+            q = q.repeat_interleave(rep, dim=1)
+            k = k.repeat_interleave(rep, dim=1)
+
+        idx = state_indices.to(torch.long)
+        # gather initial recurrent state per sequence: (N, HV, K, V)
+        state = recurrent_state[idx].to(torch.float32)
+
+        # one recurrent delta-rule step
+        state = state * g.exp()[..., None, None]
+        kv_mem = (state * k[..., None]).sum(dim=-2)        # (N, HV, V)
+        delta = (v - kv_mem) * beta[..., None]             # (N, HV, V)
+        state = state + k[..., None] * delta[..., None, :]  # (N, HV, K, V)
+        core_attn_out = (state * q[..., None]).sum(dim=-2)  # (N, HV, V)
+
+        # write the updated state back in place
+        recurrent_state[idx] = state.to(recurrent_state.dtype)
+
+        return core_attn_out.to(orig_dtype).reshape(1, N, HV, V)
+
     class AscendGatedDeltaMeta:
 
         def __init__(
@@ -471,22 +592,22 @@ def patch_gated_delta_net():
             conv_state_indices: torch.Tensor,
             gated_delta_meta: GatedDeltaMeta,
         ):
-            update_kwargs = {}
-            validate_data = True
-            
-            cache_seqlens = gated_delta_meta.cache_seqlens
             is_multi_token_decoding = gated_delta_meta.is_multi_token_decoding
+
+            if not is_multi_token_decoding:
+                # non-MTP single-token decode: pure-torch causal conv1d update.
+                # ``weight`` is (dim, width); torch helper consumes it directly.
+                out = torch_causal_conv1d_update_decode(
+                    x,
+                    weight,
+                    bias,
+                    conv_state,
+                    conv_state_indices,
+                    self.activation
+                )
+                return out.unsqueeze(0), conv_state
             
-            if is_multi_token_decoding:
-                # Ring-buffer decode path: positions are derived from cache_seqlens.
-                update_kwargs['cache_seqlens'] = gated_delta_meta.cache_seqlens
-                # Multi-token decode uses varlen format (2-D x tensor); must keep
-                # IS_VARLEN=True by passing query_start_loc, otherwise x gets incorrectly
-                # unsqueezed and cache_seqlens is accessed out-of-bounds.
-                update_kwargs['query_start_loc'] = gated_delta_meta.cu_seqlens
-                update_kwargs['max_query_len'] = gated_delta_meta.max_q_seq_len
-                validate_data = False
-                
+            # MTP ring-buffer decode still uses the triton kernel.
             out = self.causal_conv1d_update(
                 x,
                 conv_state,
@@ -494,8 +615,10 @@ def patch_gated_delta_net():
                 bias,
                 self.activation,
                 conv_state_indices=conv_state_indices,
-                validate_data=validate_data,
-                **update_kwargs,
+                validate_data=False,
+                cache_seqlens=gated_delta_meta.cache_seqlens,
+                query_start_loc=gated_delta_meta.cu_seqlens,
+                max_query_len=gated_delta_meta.max_q_seq_len
             )
             return out.unsqueeze(0), conv_state
 
@@ -561,17 +684,16 @@ def patch_gated_delta_net():
             is_multi_token_decoding = gated_delta_meta.is_multi_token_decoding
             
             if is_decoding:
-                core_attn_out = self.fused_sigmoid_gating_delta_rule_update(
+                core_attn_out = torch_sigmoid_gating_delta_rule_update_decode(
                     A_log=A_log,
                     dt_bias=dt_bias,
                     q=query,
                     k=key,
                     v=value,
-                    a=a.contiguous(),
-                    b=b.contiguous(),
-                    initial_state_source=recurrent_state,
-                    initial_state_indices=gated_delta_meta.state_ids,
-                    cu_seqlens=gated_delta_meta.cu_seqlens,
+                    a=a,
+                    b=b,
+                    recurrent_state=recurrent_state,
+                    state_indices=gated_delta_meta.state_ids,
                     use_qk_l2norm_in_kernel=True,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
