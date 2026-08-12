@@ -222,47 +222,55 @@ def patch_contiguous_cache_engine():
 
 ##### patch state cache engine #####
 def patch_state_cache_engine():
-    from typing import List, Tuple
+    from typing import List, Optional, Sequence, Tuple
+
+    from lmdeploy.pytorch.config import StateCacheSpec
     from lmdeploy.pytorch.engine import cache_engine
-    from lmdeploy.pytorch.engine.cache_engine import CacheDesc
 
     @staticmethod
     def _state_cache_engine_allocate_caches(
         num_caches: int,
-        state_shapes: List[Tuple[Tuple[int], torch.dtype]],
+        state_shapes: List[Tuple[Tuple[int, ...], torch.dtype]],
         device: torch.device,
+        state_specs: Optional[List[StateCacheSpec]] = None,
+        num_layers: Optional[int] = None,
     ):
         """Allocate cache implement.
 
-        Each state is allocated as an independent contiguous tensor of shape
-        (num_caches, *shape).  A single shared pool of shape
-        (num_caches, total_pool_size) would give views with stride[0] ==
-        total_pool_size instead of the per-state numel, making every slice
-        non-contiguous and breaking NPU ops that require contiguous input.
+        Each state is allocated as an independent contiguous tensor. A single
+        shared pool would give state views whose strides include the full pool
+        row, breaking NPU ops that require contiguous input. Layer-scoped named
+        caches use (num_rows, num_caches, *shape), matching lmdeploy's logical
+        layout while keeping every per-layer cache contiguous.
         """
 
-        cache_dtype = torch.int8
-        if len(state_shapes) == 0 or num_caches == 0:
+        cache_dtype = torch.uint8
+        state_specs = state_specs or []
+        if (len(state_shapes) == 0 and len(state_specs) == 0) or num_caches == 0:
             return torch.empty((0, 0), dtype=cache_dtype, device=device), []
 
-        cache_descs = [CacheDesc(shape, dtype) for shape, dtype in state_shapes]
+        resources = cache_engine.StateCacheEngine._get_state_cache_resources(
+            state_shapes, state_specs=state_specs, num_layers=num_layers
+        )
 
         # Allocate each state as a separate contiguous tensor.
         caches = []
-        for desc in cache_descs:
-            cache = torch.zeros(
-                (num_caches, *desc.shape), dtype=desc.dtype, device=device
-            )
+        for resource in resources:
+            desc = resource.desc
+            cache_shape = (num_caches, *desc.shape)
+            if resource.layout is not None:
+                cache_shape = (resource.num_rows, num_caches, *desc.shape[1:])
+            cache = torch.zeros(cache_shape, dtype=desc.dtype, device=device)
             caches.append(cache)
 
         # mem_pool is used by two callers:
         #   1. get_cache_state_size(): always calls with device='meta' to compute byte
         #      counts — the tensor is never materialised on a real device.
-        #   2. init_caches(): patched below to zero individual caches directly, so it
-        #      no longer touches mem_pool at all.
+        #   2. init_caches()/copy_caches(): patched below to operate on the independent
+        #      cache tensors directly, so they no longer touch mem_pool at all.
         # Therefore we only need a correctly-sized pool on 'meta'; for real devices we
         # return an empty placeholder to avoid doubling the state-cache memory footprint.
-        total_bytes = sum(desc.aligned_size for desc in cache_descs)
+        total_bytes = sum(resource.desc.aligned_size for resource in resources)
         if str(device) == "meta":
             mem_pool = torch.empty(
                 (num_caches, total_bytes), dtype=cache_dtype, device=device
@@ -270,6 +278,14 @@ def patch_state_cache_engine():
         else:
             mem_pool = torch.empty(0, dtype=cache_dtype, device=device)
         return mem_pool, caches
+
+    def _state_cache_slot_dim(self, cache_idx: int):
+        """Return the state-slot dimension for one cache tensor."""
+        cache_names = getattr(self, "_state_cache_names", [])
+        layer_maps = getattr(self, "_state_cache_layer_maps", {})
+        if cache_idx < len(cache_names) and cache_names[cache_idx] in layer_maps:
+            return 1
+        return 0
 
     def _state_cache_engine_init_caches(self, idx: torch.Tensor, mask: torch.Tensor):
         """Initialize state caches by zeroing each individual cache tensor."""
@@ -280,12 +296,54 @@ def patch_state_cache_engine():
         num_caches = self.cache_config.num_state_caches
         cache_masks = torch.zeros((num_caches,), dtype=torch.bool, device=idx.device)
         cache_masks.index_copy_(0, idx, mask)
-        for cache in self._state_caches:
-            reshaped_mask = cache_masks.view((-1,) + (1,) * (cache.dim() - 1))
+        for cache_idx, cache in enumerate(self._state_caches):
+            slot_dim = _state_cache_slot_dim(self, cache_idx)
+            mask_shape = [1] * cache.dim()
+            mask_shape[slot_dim] = num_caches
+            reshaped_mask = cache_masks.view(mask_shape)
             cache.masked_fill_(reshaped_mask, 0)
+
+    def _state_cache_engine_copy_caches(
+        self, src_idx: int | Sequence[int], dst_idx: int | Sequence[int]
+    ):
+        """Copy slots between independently allocated state-cache tensors."""
+        if len(self._state_caches) <= 0:
+            return
+
+        src_list = self._index_list(src_idx)
+        dst_list = self._index_list(dst_idx)
+        if len(src_list) != len(dst_list):
+            raise ValueError(
+                "src_idx and dst_idx must have the same number of elements."
+            )
+        if len(src_list) == 0:
+            return
+
+        num_caches = self.cache_config.num_state_caches
+        self._validate_index_bounds(src_list, num_caches)
+        self._validate_index_bounds(dst_list, num_caches)
+        dst_set = set(dst_list)
+        if len(dst_set) != len(dst_list):
+            raise ValueError("dst_idx must not contain duplicate entries.")
+        if not set(src_list).isdisjoint(dst_set):
+            raise ValueError(
+                "src_idx and dst_idx must not overlap for stream-ordered state copies."
+            )
+
+        for cache_idx, cache in enumerate(self._state_caches):
+            slot_dim = _state_cache_slot_dim(self, cache_idx)
+            for src, dst, length in self._copy_ranges(src_list, dst_list):
+                src_slice = [slice(None)] * cache.dim()
+                dst_slice = [slice(None)] * cache.dim()
+                src_slice[slot_dim] = slice(src, src + length)
+                dst_slice[slot_dim] = slice(dst, dst + length)
+                cache[tuple(dst_slice)].copy_(
+                    cache[tuple(src_slice)], non_blocking=True
+                )
 
     cache_engine.StateCacheEngine.allocate_caches = _state_cache_engine_allocate_caches
     cache_engine.StateCacheEngine.init_caches = _state_cache_engine_init_caches
+    cache_engine.StateCacheEngine.copy_caches = _state_cache_engine_copy_caches
 
 
 def patch_gated_delta_net():
