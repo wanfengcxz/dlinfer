@@ -399,11 +399,16 @@ class AscendSingleGraphRunner:
         self.model.update_context_cudagraph(self.meta, context)
         if aclgraph_use_torch_npu_update():
             self._graph.replay()
-            self._graph.update(
-                cpu_update_input=[
+            graph_params = get_graph_params()
+            if graph_params.is_mla:
+                cpu_update_input = [
+                    {"actual_seq_kvlen": self.meta.input_buffers["kv_seqlens"].tolist()}
+                ]
+            else:
+                cpu_update_input = [
                     {"actual_seq_lengths_kv": self.meta.input_buffers["kv_seqlens"]}
                 ]
-            )
+            self._graph.update(cpu_update_input=cpu_update_input)
         else:
             update_attn_params(self.update_stream, self.meta, self.max_batches)
             self._graph.replay()

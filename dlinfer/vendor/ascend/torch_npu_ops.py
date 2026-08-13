@@ -2,6 +2,7 @@
 import math
 import torch
 import torch.distributed as dist
+import torch_npu
 
 from typing import List
 from dlinfer.vendor import vendor_ops_registry
@@ -197,29 +198,73 @@ def prefill_attention(
     else:
         # Handle qwenvl vision part flash-attention
         q_seq_len = get_cpu_seq_len(q_seq_len)
-        torch.ops.atb._npu_flash_attention_unpad(
+        is_tnd = (
+            query.dim() == 3
+            and query.shape[-2] == num_q_heads
+            and key.shape[-2] == num_kv_heads
+        )
+        input_layout = "TND" if is_tnd else "BSH"
+        actual_seq_lengths = (
+            q_seq_len.cumsum(dim=0).tolist() if is_tnd else None
+        )
+        fai_kwargs = {}
+        if is_tnd and query.shape[-1] > value.shape[-1]:
+            nope_dim = value.shape[-1]
+            fai_kwargs["query_rope"] = query[..., nope_dim:]
+            fai_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
+            query = query[..., :nope_dim].contiguous()
+            key = key[..., :nope_dim].contiguous()
+        output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
             value=value,
-            seq_len=q_seq_len,
-            scale_value=scale_value,
+            input_layout=input_layout,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+            scale=scale_value,
             num_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            out=attn_output,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=0,
+            **fai_kwargs,
         )
+        attn_output.copy_(output)
         return attn_output
     if SocVersion.is_Ascend910():
-        torch.ops.atb._npu_flash_attention(
+        q_seq_len = get_cpu_seq_len(q_seq_len)
+        actual_seq_lengths = q_seq_len.cumsum(dim=0).tolist()
+
+        # With different QK and V head dimensions, FAI v1 requires a
+        # B1S1S2 attention mask in sparse mode 0. Expand is a zero-copy view.
+        if mask.dim() == 2:
+            mask = mask.to(torch.bool)[None, None].expand(
+                q_seq_len.numel(), 1, -1, -1
+            )
+
+        fai_kwargs = {}
+        if query.shape[-1] > value.shape[-1]:
+            # MLA concatenates the NOPE and ROPE parts in Q/K. FAI accepts
+            # large MLA head dimensions only when the ROPE part is separate.
+            nope_dim = value.shape[-1]
+            fai_kwargs["query_rope"] = query[..., nope_dim:]
+            fai_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
+            query = query[..., :nope_dim].contiguous()
+            key = key[..., :nope_dim].contiguous()
+
+        output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
             value=value,
-            mask=mask,
-            seq_len=q_seq_len,
-            scale_value=scale_value,
+            atten_mask=mask,
+            input_layout="TND",
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+            scale=scale_value,
             num_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            out=attn_output,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=0,
+            **fai_kwargs,
         )
+        attn_output.copy_(output)
     elif SocVersion.is_Ascend310P():
         # Used for Qwen2.5-VL model vision block
         query = query.unsqueeze(0)
