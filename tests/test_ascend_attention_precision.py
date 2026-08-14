@@ -12,6 +12,14 @@ pytestmark = pytest.mark.lmdeploy
 if not torch.npu.is_available():
     pytest.skip("Ascend NPU is required", allow_module_level=True)
 
+from dlinfer.framework.lmdeploy_ext.cudagraph.ascend_cudagraph import (
+    AscendGraphRunner,
+    aclgraph_use_torch_npu_update,
+    clear_graph_params,
+    get_graph_params,
+    set_graph_params,
+)
+from dlinfer.ops import paged_prefill_attention
 from dlinfer.vendor.ascend.attention import decode_attention_mla
 from dlinfer.vendor.ascend.torch_npu_ops import prefill_attention
 
@@ -98,6 +106,37 @@ def _torch_decode_attention(query, key_cache, block_table, kv_seq_lens):
     return torch.stack(outputs)
 
 
+def _torch_paged_prefill_attention(
+    query, key_cache, block_table, q_seq_lens, kv_seq_lens
+):
+    outputs = []
+    query_start = 0
+    block_size = key_cache.shape[1]
+    for batch_idx, (q_seq_len, kv_seq_len) in enumerate(
+        zip(q_seq_lens, kv_seq_lens)
+    ):
+        num_blocks = math.ceil(kv_seq_len / block_size)
+        block_ids = block_table[batch_idx, :num_blocks].long()
+        key = key_cache[block_ids].flatten(0, 1)[:kv_seq_len]
+        value = key[..., :MLA_V_HEAD_DIM]
+        query_end = query_start + q_seq_len
+
+        q = query[query_start:query_end].float().transpose(0, 1)
+        k = _repeat_kv(key, NUM_Q_HEADS).float().transpose(0, 1)
+        v = _repeat_kv(value, NUM_Q_HEADS).float().transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * MLA_SOFTMAX_SCALE
+
+        history_len = kv_seq_len - q_seq_len
+        q_positions = history_len + torch.arange(q_seq_len)
+        kv_positions = torch.arange(kv_seq_len)
+        causal_mask = kv_positions.unsqueeze(0) > q_positions.unsqueeze(1)
+        scores.masked_fill_(causal_mask.unsqueeze(0), float("-inf"))
+        outputs.append(torch.matmul(torch.softmax(scores, dim=-1), v).transpose(0, 1))
+        query_start = query_end
+
+    return torch.cat(outputs)
+
+
 def _assert_prefill_attention_matches_torch(
     qk_head_dim, value_head_dim, softmax_scale, causal_mask
 ):
@@ -165,6 +204,147 @@ def test_prefill_attention_mla_matches_torch(fai_causal_mask):
         softmax_scale=MLA_SOFTMAX_SCALE,
         causal_mask=fai_causal_mask,
     )
+
+
+def test_paged_prefill_attention_mla_matches_torch(fai_causal_mask):
+    torch.manual_seed(20260814)
+    q_seq_lens = [3, 2]
+    kv_seq_lens = [130, 77]
+    cumulative_q_seq_lens = [3, 5]
+    block_size = 128
+    num_blocks = 4
+    block_table = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32)
+
+    query = _randn((sum(q_seq_lens), NUM_Q_HEADS, MLA_QK_HEAD_DIM))
+    key_cache = _randn(
+        (num_blocks, block_size, NUM_KV_HEADS, MLA_QK_HEAD_DIM)
+    )
+    expected = _torch_paged_prefill_attention(
+        query, key_cache, block_table, q_seq_lens, kv_seq_lens
+    )
+
+    query = query.to(DEVICE)
+    key_cache = key_cache.to(DEVICE)
+    value_cache = key_cache[..., :MLA_V_HEAD_DIM]
+    output = torch.empty(
+        (sum(q_seq_lens), NUM_Q_HEADS, MLA_V_HEAD_DIM),
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+
+    actual = paged_prefill_attention(
+        query=query,
+        key=query[:, :NUM_KV_HEADS],
+        value=query[:, :NUM_KV_HEADS, :MLA_V_HEAD_DIM],
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table.to(DEVICE),
+        block_size=block_size,
+        q_start_loc=None,
+        q_seq_len=torch.tensor(cumulative_q_seq_lens, dtype=torch.int32),
+        kv_seq_len=torch.tensor(kv_seq_lens, dtype=torch.int32),
+        cu_seq_lens_kv=None,
+        max_q_seq_len=max(q_seq_lens),
+        max_kv_seq_len=max(kv_seq_lens),
+        num_q_heads=NUM_Q_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        attn_mask=[fai_causal_mask],
+        softmax_scale=MLA_SOFTMAX_SCALE,
+        alibi_slopes=None,
+        attn_output=output,
+        kv_scales=None,
+        kv_zeros=None,
+        quant_bits=0,
+        head_size_v=MLA_V_HEAD_DIM,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual.cpu().float(), expected, rtol=5e-3, atol=5e-3)
+
+
+def test_paged_prefill_attention_mla_graph_replay(fai_causal_mask):
+    if not aclgraph_use_torch_npu_update():
+        pytest.skip("FAI v2 graph update requires torch_npu >= 2.8.0.post1")
+
+    torch.manual_seed(20260814)
+    q_seq_lens = [2]
+    capture_kv_seq_lens = [9]
+    replay_kv_seq_lens = [7]
+    block_size = 128
+    block_table = torch.tensor([[0]], dtype=torch.int32)
+    query = _randn((sum(q_seq_lens), NUM_Q_HEADS, MLA_QK_HEAD_DIM))
+    key_cache = _randn(
+        (1, block_size, NUM_KV_HEADS, MLA_QK_HEAD_DIM)
+    )
+    expected = _torch_paged_prefill_attention(
+        query, key_cache, block_table, q_seq_lens, replay_kv_seq_lens
+    )
+
+    query = query.to(DEVICE)
+    key_cache = key_cache.to(DEVICE)
+    output = torch.empty(
+        (sum(q_seq_lens), NUM_Q_HEADS, MLA_V_HEAD_DIM),
+        dtype=DTYPE,
+        device=DEVICE,
+    )
+    kwargs = dict(
+        query=query,
+        key=query[:, :NUM_KV_HEADS],
+        value=query[:, :NUM_KV_HEADS, :MLA_V_HEAD_DIM],
+        key_cache=key_cache,
+        value_cache=key_cache[..., :MLA_V_HEAD_DIM],
+        block_table=block_table.to(DEVICE),
+        block_size=block_size,
+        q_start_loc=None,
+        q_seq_len=torch.tensor(q_seq_lens, dtype=torch.int32),
+        kv_seq_len=torch.tensor(capture_kv_seq_lens, dtype=torch.int32),
+        cu_seq_lens_kv=None,
+        max_q_seq_len=max(q_seq_lens),
+        max_kv_seq_len=max(capture_kv_seq_lens),
+        num_q_heads=NUM_Q_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        attn_mask=[fai_causal_mask],
+        softmax_scale=MLA_SOFTMAX_SCALE,
+        alibi_slopes=None,
+        attn_output=output,
+        kv_scales=None,
+        kv_zeros=None,
+        quant_bits=0,
+        head_size_v=MLA_V_HEAD_DIM,
+    )
+
+    # Warm up allocations before capture, matching the model graph runner.
+    paged_prefill_attention(**kwargs)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    capture_stream = torch.npu.Stream()
+    set_graph_params({sum(q_seq_lens)})
+    graph_params = get_graph_params()
+    graph_params.is_mla = False
+    try:
+        AscendGraphRunner.capturing = True
+        with torch.npu.graph(
+            graph,
+            auto_dispatch_capture=True,
+            stream=capture_stream,
+        ):
+            actual = paged_prefill_attention(**kwargs)
+        AscendGraphRunner.capturing = False
+
+        graph.replay()
+        graph.update(cpu_update_input=[{"actual_seq_kvlen": replay_kv_seq_lens}])
+        torch.npu.synchronize()
+
+        assert graph_params.is_mla
+        assert actual.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(
+            actual.cpu().float(), expected, rtol=5e-3, atol=5e-3
+        )
+    finally:
+        AscendGraphRunner.capturing = False
+        graph.reset()
+        clear_graph_params()
 
 
 def test_decode_attention_mla_matches_torch():
