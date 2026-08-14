@@ -207,11 +207,11 @@ def prefill_attention(
         actual_seq_lengths = (
             q_seq_len.cumsum(dim=0).tolist() if is_tnd else None
         )
-        fai_kwargs = {}
+        fia_kwargs = {}
         if is_tnd and query.shape[-1] > value.shape[-1]:
             nope_dim = value.shape[-1]
-            fai_kwargs["query_rope"] = query[..., nope_dim:]
-            fai_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
+            fia_kwargs["query_rope"] = query[..., nope_dim:].contiguous()
+            fia_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
             query = query[..., :nope_dim].contiguous()
             key = key[..., :nope_dim].contiguous()
         output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -225,7 +225,7 @@ def prefill_attention(
             num_heads=num_q_heads,
             num_key_value_heads=num_kv_heads,
             sparse_mode=0,
-            **fai_kwargs,
+            **fia_kwargs,
         )
         attn_output.copy_(output)
         return attn_output
@@ -233,20 +233,15 @@ def prefill_attention(
         q_seq_len = get_cpu_seq_len(q_seq_len)
         actual_seq_lengths = q_seq_len.cumsum(dim=0).tolist()
 
-        # With different QK and V head dimensions, FAI v1 requires a
-        # B1S1S2 attention mask in sparse mode 0. Expand is a zero-copy view.
-        if mask.dim() == 2:
-            mask = mask.to(torch.bool)[None, None].expand(
-                q_seq_len.numel(), 1, -1, -1
-            )
-
-        fai_kwargs = {}
+        # The backend supplies the fixed split-fuse causal mask required by
+        # sparse mode 3 for both standard attention and MLA.
+        fia_kwargs = {}
         if query.shape[-1] > value.shape[-1]:
-            # MLA concatenates the NOPE and ROPE parts in Q/K. FAI accepts
+            # MLA concatenates the NOPE and ROPE parts in Q/K. FIA accepts
             # large MLA head dimensions only when the ROPE part is separate.
             nope_dim = value.shape[-1]
-            fai_kwargs["query_rope"] = query[..., nope_dim:]
-            fai_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
+            fia_kwargs["query_rope"] = query[..., nope_dim:].contiguous()
+            fia_kwargs["key_rope"] = key[..., nope_dim:].contiguous()
             query = query[..., :nope_dim].contiguous()
             key = key[..., :nope_dim].contiguous()
 
@@ -261,8 +256,8 @@ def prefill_attention(
             scale=scale_value,
             num_heads=num_q_heads,
             num_key_value_heads=num_kv_heads,
-            sparse_mode=0,
-            **fai_kwargs,
+            sparse_mode=3,
+            **fia_kwargs,
         )
         attn_output.copy_(output)
     elif SocVersion.is_Ascend310P():
