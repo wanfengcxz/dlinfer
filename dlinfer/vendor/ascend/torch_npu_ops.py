@@ -208,9 +208,7 @@ def prefill_attention(
             and key.shape[-2] == num_kv_heads
         )
         input_layout = "TND" if is_tnd else "BSH"
-        actual_seq_lengths = (
-            q_seq_len.cumsum(dim=0).tolist() if is_tnd else None
-        )
+        actual_seq_lengths = q_seq_len.cumsum(dim=0) if is_tnd else None
         fia_kwargs = {}
         if is_tnd and query.shape[-1] > value.shape[-1]:
             nope_dim = value.shape[-1]
@@ -235,7 +233,7 @@ def prefill_attention(
         return attn_output
     if SocVersion.is_Ascend910():
         q_seq_len = get_cpu_seq_len(q_seq_len)
-        actual_seq_lengths = q_seq_len.cumsum(dim=0).tolist()
+        actual_seq_lengths = q_seq_len.cumsum(dim=0)
 
         # The backend supplies the fixed split-fuse causal mask required by
         # sparse mode 3 for both standard attention and MLA.
@@ -548,8 +546,8 @@ def paged_prefill_attention(
             softmax_scale=scale_value,
             block_table=block_table,
             block_size=block_size,
-            actual_seq_qlen=q_seq_len.tolist(),
-            actual_seq_kvlen=kv_seq_len.tolist(),
+            actual_seq_qlen=q_seq_len,
+            actual_seq_kvlen=kv_seq_len,
         )
 
         # TND_NTD returns [num_heads, num_tokens, value_head_size].

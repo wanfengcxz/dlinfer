@@ -130,7 +130,7 @@ def decode_attention_mla(
             block_table=block_table,
             block_size=block_size,
             actual_seq_qlen=None,
-            actual_seq_kvlen=kv_seq_len.tolist(),
+            actual_seq_kvlen=kv_seq_len,
         )
 
         attn_output.copy_(fai_output.squeeze(2).transpose(0, 1))
