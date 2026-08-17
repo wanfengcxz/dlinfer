@@ -6,10 +6,6 @@ import torch_npu
 
 from typing import List
 from dlinfer.vendor import vendor_ops_registry
-from dlinfer.framework.lmdeploy_ext.cudagraph.ascend_cudagraph import (
-    AscendGraphRunner,
-    get_graph_params,
-)
 from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import (
     Tensor,
@@ -262,20 +258,6 @@ def prefill_attention(
             **fia_kwargs,
         )
         attn_output.copy_(output)
-    elif SocVersion.is_Ascend310P():
-        # Used for Qwen2.5-VL model vision block
-        query = query.unsqueeze(0)
-        key = key.unsqueeze(0)
-        value = value.unsqueeze(0)
-        attn_output[:] = torch.ops.npu.npu_prompt_flash_attention(
-            query,
-            key,
-            value,
-            num_heads=num_q_heads,
-            num_key_value_heads=num_kv_heads,
-            input_layout="BSND",
-            scale_value=scale_value,
-        )
     else:
         raise ValueError(
             f"dlinfer doesn't support {SocVersion.device_name()} device currently."
@@ -528,9 +510,6 @@ def paged_prefill_attention(
         k_rope = key_cache[..., mla_vheadsize:]
         v_nope = value_cache[..., :mla_vheadsize]
         mask = attn_mask[0] if len(attn_mask) else None
-
-        if AscendGraphRunner.capturing:
-            get_graph_params().is_mla = True
 
         output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             q_nope,
