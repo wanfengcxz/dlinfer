@@ -11,7 +11,9 @@ _graph_capture_sizes: set[int] = None
 
 - `_graph_params` 历史上保存旧版 Attention graph-task 更新所需的图资源，必须在 rollout reset 时清理。
 - `_graph_capture_sizes` 当前只有赋值和清空，没有任何读取位置，因此没有实际控制作用。
-- RL re-capture 修复真正依赖的是 `_get_capture_batch_size_impl.cache_clear()`，而不是 `_graph_capture_sizes` 变量本身。
+- RL re-capture 修复真正依赖的是
+  `_get_capture_batch_size_impl.cache_clear()`，而不是
+  `_graph_capture_sizes` 变量本身。
 - “capture size 需要跨 rollout 保存”指 capture-size 策略或配置，不是旧图的 handle、event 和 Tensor 引用。
 
 > 实现状态（2026-08-17）：本文第 6 节的重构已经落地。旧 ATB
@@ -20,7 +22,9 @@ _graph_capture_sizes: set[int] = None
 
 ## 1. `_graph_params` 的历史用途
 
-`_graph_params` 最早在提交 [`5c474737`](https://github.com/DeepLink-org/dlinfer/commit/5c4747371b6bd3f39a71656c74e99e3429f259d1) 中引入，用于支持旧版 ATB Attention 的 graph-task 动态参数更新：
+`_graph_params` 最早在提交
+[`5c474737`](https://github.com/DeepLink-org/dlinfer/commit/5c4747371b6bd3f39a71656c74e99e3429f259d1)
+中引入，用于支持旧版 ATB Attention 的 graph-task 动态参数更新：
 
 ```python
 @dataclass
@@ -66,7 +70,9 @@ torch.ops.atb._npu_paged_attention(...)
 torch.npu.graph_task_update_end(...)
 ```
 
-因此，`_graph_params` 本质上是旧 ATB Attention kernel 与 Graph Runner 之间的全局 side channel。它不是普通配置元信息，而是持有真实图资源和 Tensor 引用的对象。
+因此，`_graph_params` 本质上是旧 ATB Attention kernel 与 Graph
+Runner 之间的全局 side channel。它不是普通配置元信息，而是持有真实图资源和
+Tensor 引用的对象。
 
 ## 2. 为什么 rollout 之间必须清理 `_graph_params`
 
@@ -90,7 +96,9 @@ rollout N 推理
 
 所以 `_graph_params` 不能跨 rollout 复用。
 
-提交 [`d0f60279`](https://github.com/DeepLink-org/dlinfer/commit/d0f60279a684de7dd37f0cab59d5065747faf598) 为此增加了 `clear_graph_params()`：
+提交
+[`d0f60279`](https://github.com/DeepLink-org/dlinfer/commit/d0f60279a684de7dd37f0cab59d5065747faf598)
+为此增加了 `clear_graph_params()`：
 
 ```python
 attn_params.clear()
@@ -172,7 +180,9 @@ get_graph_params().events[...]
 
 ## 4. `_graph_capture_sizes` 的实际作用
 
-`_graph_capture_sizes` 由 [`PR #319: fix re-capture in RL`](https://github.com/DeepLink-org/dlinfer/pull/319) 引入：
+`_graph_capture_sizes` 由
+[`PR #319: fix re-capture in RL`](https://github.com/DeepLink-org/dlinfer/pull/319)
+引入：
 
 ```python
 _graph_capture_sizes: set[int] = None
@@ -198,7 +208,9 @@ _get_capture_batch_size_impl.cache_clear()
 - 赋值；
 - 清空。
 
-代码中没有读取它的 getter，也没有用它重新初始化 `GraphParams`。因此，按照当前实现，`_graph_capture_sizes` 是一个冗余的 bookkeeping 变量，对 re-capture 没有功能性贡献。
+代码中没有读取它的 getter，也没有用它重新初始化 `GraphParams`。因此，按照当前实现，
+`_graph_capture_sizes` 是一个冗余的 bookkeeping 变量，对 re-capture
+没有功能性贡献。
 
 PR #319 真正修复问题的是：
 
@@ -227,7 +239,9 @@ CacheConfig.max_batches
 CacheConfig.cudagraph_capture_batch_sizes
 ```
 
-LMDeploy 后来在提交 [`4f25485e`](https://github.com/InternLM/lmdeploy/commit/4f25485e218d5e0938240da1d4fccbb426573a89) 中正式把 capture sizes 放进了 `CacheConfig`：
+LMDeploy 后来在提交
+[`4f25485e`](https://github.com/InternLM/lmdeploy/commit/4f25485e218d5e0938240da1d4fccbb426573a89)
+中正式把 capture sizes 放进了 `CacheConfig`：
 
 ```python
 cudagraph_capture_batch_sizes: list[int] | None
@@ -311,6 +325,7 @@ inference
 最终可以删除 `_graph_params` 和 `_graph_capture_sizes`，但必须保留它们背后的两类语义：
 
 - `_graph_params` 背后的旧图资源生命周期：新路径中由每个 `NPUGraph` 自己管理，并在 reset 时释放。
-- `_graph_capture_sizes` 名字所暗示的 capture-size 策略：迁移到持久的 `CacheConfig`，不能随着 rollout 丢失。
+- `_graph_capture_sizes` 名字所暗示的 capture-size 策略：迁移到持久的
+  `CacheConfig`，不能随着 rollout 丢失。
 
 换句话说，需要保留的是生命周期语义和配置来源，而不是这两个模块级全局变量本身。
